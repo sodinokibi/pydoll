@@ -156,6 +156,8 @@ class UltimateCrawler:
             'subdomains_found': 0,
             'domains_crawled': 0,
             'captchas_solved': 0,
+            'duplicates_skipped': 0,
+            'media_skipped': 0,
             'errors': 0
         }
 
@@ -576,6 +578,9 @@ class UltimateCrawler:
 
             async with self.lock:
                 if content_hash in self.content_hashes:
+                    if self.verbose:
+                        print(f"  [SKIP] Duplicate content: {url[:60]}")
+                    self.stats['duplicates_skipped'] += 1
                     return
                 self.content_hashes.add(content_hash)
 
@@ -753,6 +758,8 @@ class UltimateCrawler:
                 if should_skip:
                     if self.verbose:
                         print(f"  [SKIP] {reason}: {req_info['url'][:60]}")
+                    async with self.lock:
+                        self.stats['media_skipped'] += 1
                     return
 
                 body = await tab.get_response_body(request_id)
@@ -1039,6 +1046,8 @@ class UltimateCrawler:
                 'pages_crawled': self.stats['pages_crawled'],
                 'subdomains_found': self.stats['subdomains_found'],
                 'captchas_solved': self.stats['captchas_solved'],
+                'duplicates_skipped': self.stats['duplicates_skipped'],
+                'media_skipped': self.stats['media_skipped'],
                 'errors': self.stats['errors']
             },
             'captured_files': {
@@ -1069,6 +1078,9 @@ class UltimateCrawler:
         print(f"   ⚠️  High Priority:   {self.stats['high_priority_files']}")
         if self.bypass_captcha:
             print(f"   CAPTCHAs Solved:    {self.stats['captchas_solved']}")
+        print(f"\n   Duplicates Skipped: {self.stats['duplicates_skipped']}")
+        if self.skip_media:
+            print(f"   Media Files Skipped: {self.stats['media_skipped']}")
         print(f"   Errors:             {self.stats['errors']}")
         print(f"\n📁 Output: {self.output_dir.absolute()}")
         print(f"\n🔍 Next Step:")
