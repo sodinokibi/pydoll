@@ -126,6 +126,8 @@ class UltimateCrawler:
         (self.output_dir / "html_pages").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "high_priority").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "metadata").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "instant_alerts").mkdir(parents=True, exist_ok=True)
 
     def _load_domains_from_file(self, filepath: str) -> List[str]:
         """Load domains from file"""
@@ -292,8 +294,109 @@ class UltimateCrawler:
         except:
             return 'index'
 
-    async def _save_content(self, url: str, content: str, content_type: str, is_high_priority: bool = False):
-        """Save content (thread-safe)"""
+    def _quick_detect_secrets(self, content: str) -> List[dict]:
+        """
+        Quick detection of OBVIOUS secrets (high precision patterns only).
+        This doesn't replace TruffleHog - it's for instant alerts during crawl.
+        """
+        secrets_found = []
+
+        try:
+            # AWS Access Keys (very distinctive)
+            aws_pattern = r'(AKIA|ABIA|ACCA)[A-Z0-9]{16}'
+            for match in re.finditer(aws_pattern, content):
+                secrets_found.append({
+                    'type': 'AWS Access Key',
+                    'value': match.group(0),
+                    'position': match.start()
+                })
+
+            # GitHub Personal Access Tokens
+            github_patterns = [
+                (r'ghp_[a-zA-Z0-9]{36}', 'GitHub Personal Access Token'),
+                (r'gho_[a-zA-Z0-9]{36}', 'GitHub OAuth Token'),
+                (r'ghu_[a-zA-Z0-9]{36}', 'GitHub User Token'),
+                (r'ghs_[a-zA-Z0-9]{36}', 'GitHub Server Token'),
+                (r'ghr_[a-zA-Z0-9]{36}', 'GitHub Refresh Token'),
+            ]
+            for pattern, name in github_patterns:
+                for match in re.finditer(pattern, content):
+                    secrets_found.append({
+                        'type': name,
+                        'value': match.group(0),
+                        'position': match.start()
+                    })
+
+            # Private Keys (unmistakable)
+            if '-----BEGIN PRIVATE KEY-----' in content or '-----BEGIN RSA PRIVATE KEY-----' in content:
+                secrets_found.append({
+                    'type': 'Private Key',
+                    'value': 'PRIVATE_KEY_FOUND',
+                    'position': content.find('-----BEGIN')
+                })
+
+            # Stripe Keys (very distinctive)
+            stripe_patterns = [
+                (r'sk_live_[a-zA-Z0-9]{24,}', 'Stripe Live Secret Key'),
+                (r'sk_test_[a-zA-Z0-9]{24,}', 'Stripe Test Secret Key'),
+                (r'rk_live_[a-zA-Z0-9]{24,}', 'Stripe Live Restricted Key'),
+            ]
+            for pattern, name in stripe_patterns:
+                for match in re.finditer(pattern, content):
+                    secrets_found.append({
+                        'type': name,
+                        'value': match.group(0),
+                        'position': match.start()
+                    })
+
+            # Slack Tokens (distinctive prefixes)
+            slack_patterns = [
+                (r'xoxb-[a-zA-Z0-9\-]{50,}', 'Slack Bot Token'),
+                (r'xoxp-[a-zA-Z0-9\-]{50,}', 'Slack User Token'),
+                (r'xoxa-[a-zA-Z0-9\-]{50,}', 'Slack App Token'),
+            ]
+            for pattern, name in slack_patterns:
+                for match in re.finditer(pattern, content):
+                    secrets_found.append({
+                        'type': name,
+                        'value': match.group(0),
+                        'position': match.start()
+                    })
+
+            # Google API Keys (distinctive prefix)
+            google_pattern = r'AIza[a-zA-Z0-9_\-]{35}'
+            for match in re.finditer(google_pattern, content):
+                secrets_found.append({
+                    'type': 'Google API Key',
+                    'value': match.group(0),
+                    'position': match.start()
+                })
+
+            # OpenAI API Keys
+            openai_pattern = r'sk-proj-[a-zA-Z0-9]{40,}'
+            for match in re.finditer(openai_pattern, content):
+                secrets_found.append({
+                    'type': 'OpenAI API Key',
+                    'value': match.group(0),
+                    'position': match.start()
+                })
+
+            # Generic JWT tokens (high entropy base64)
+            jwt_pattern = r'eyJ[a-zA-Z0-9_\-]+\.eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+'
+            for match in re.finditer(jwt_pattern, content):
+                secrets_found.append({
+                    'type': 'JWT Token',
+                    'value': match.group(0)[:50] + '...',  # Truncate for display
+                    'position': match.start()
+                })
+
+        except Exception as e:
+            pass  # Don't let detection errors break crawling
+
+        return secrets_found
+
+    async def _save_content(self, url: str, content: str, content_type: str, is_high_priority: bool = False, response_data: dict = None):
+        """Save content with metadata (thread-safe)"""
         try:
             content_hash = self._hash_content(content)
 
@@ -301,6 +404,9 @@ class UltimateCrawler:
                 if content_hash in self.content_hashes:
                     return
                 self.content_hashes.add(content_hash)
+
+            # Quick secret detection (high precision patterns only)
+            quick_secrets = self._quick_detect_secrets(content)
 
             dir_map = {
                 'env_file': self.output_dir / "env_files",
@@ -323,6 +429,38 @@ class UltimateCrawler:
             filepath = save_dir / filename
             filepath.write_text(content, encoding='utf-8', errors='ignore')
 
+            # Save metadata for context enrichment
+            metadata = {
+                'url': url,
+                'content_hash': content_hash,
+                'content_type': content_type,
+                'file_path': str(filepath),
+                'timestamp': datetime.now().isoformat(),
+                'is_high_priority': is_high_priority,
+                'file_size': len(content),
+                'quick_secrets_found': quick_secrets,
+                'response_data': response_data or {}
+            }
+
+            metadata_file = self.output_dir / "metadata" / f"{content_hash}.json"
+            metadata_file.write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+
+            # Instant alert if obvious secrets found
+            if quick_secrets:
+                alert_file = self.output_dir / "instant_alerts" / filename
+                alert_file.write_text(content, encoding='utf-8', errors='ignore')
+
+                # Log alert
+                print(f"\n{'='*80}")
+                print(f"🚨 INSTANT ALERT - OBVIOUS SECRETS DETECTED!")
+                print(f"{'='*80}")
+                print(f"URL: {url}")
+                print(f"File: {filepath}")
+                for secret in quick_secrets:
+                    value_display = secret['value'][:50] + '...' if len(secret['value']) > 50 else secret['value']
+                    print(f"  • {secret['type']}: {value_display}")
+                print(f"{'='*80}\n")
+
             if is_high_priority:
                 (self.output_dir / "high_priority" / filename).write_text(content, encoding='utf-8', errors='ignore')
                 async with self.lock:
@@ -338,7 +476,8 @@ class UltimateCrawler:
 
             if self.verbose:
                 priority = "⚠️ " if is_high_priority else "  "
-                print(f"  {priority}[{content_type}] {url[:70]}")
+                secret_indicator = " 🚨" if quick_secrets else ""
+                print(f"  {priority}[{content_type}]{secret_indicator} {url[:70]}")
 
         except Exception as e:
             async with self.lock:
@@ -407,7 +546,17 @@ class UltimateCrawler:
                 content_type = self._classify_content(req_info['url'], body, response.get('mimeType', ''))
                 is_high_priority = req_info['priority'] == 'high'
 
-                await self._save_content(req_info['url'], body, content_type, is_high_priority)
+                # Prepare response metadata
+                response_data = {
+                    'status': status,
+                    'mime_type': response.get('mimeType', ''),
+                    'headers': response.get('headers', {}),
+                    'method': req_info['method'],
+                    'request_type': req_info['type'],
+                    'post_data': req_info.get('post_data')
+                }
+
+                await self._save_content(req_info['url'], body, content_type, is_high_priority, response_data)
 
                 if req_info['method'] == 'POST':
                     async with self.lock:
@@ -458,7 +607,16 @@ class UltimateCrawler:
 
             html = await tab.page_source
             is_secret_prone, priority = self._is_secret_prone_file(url)
-            await self._save_content(url, html, 'html_page', priority == 'high')
+
+            # HTML page metadata
+            html_response_data = {
+                'status': 200,
+                'mime_type': 'text/html',
+                'method': 'GET',
+                'request_type': 'Document'
+            }
+
+            await self._save_content(url, html, 'html_page', priority == 'high', html_response_data)
 
             discovered_urls = self._extract_links(html, url)
 
