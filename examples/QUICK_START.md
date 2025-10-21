@@ -45,6 +45,55 @@ python secret_scanner_crawler.py https://example.com \
 ./scan_for_secrets.sh https://example.com
 ```
 
+### Ultimate Crawler (Multi-Domain + Speed)
+```bash
+# Single domain
+python ultimate_crawler.py https://example.com
+
+# Multiple domains from file
+python ultimate_crawler.py --domains domains.txt
+
+# Multi-domain with 5 concurrent tabs (5x faster)
+python ultimate_crawler.py --domains domains.txt --tabs 5
+
+# Full featured
+python ultimate_crawler.py --domains domains.txt \
+    --tabs 5 \
+    --discover-subdomains \
+    --max-pages 1000 \
+    --proxy http://proxy:8080 \
+    --bypass-captcha
+```
+
+---
+
+## 📝 Domain List Format
+
+Create a `domains.txt` file for multi-domain scans:
+
+```
+# Lines starting with # are comments
+# Domains can be with or without https://
+
+# E-commerce sites
+example.com
+shop.example.com
+https://api.example.com
+
+# SaaS platforms
+app.mycompany.com
+staging.mycompany.com
+
+# Corporate sites
+company.io
+www.company.io
+```
+
+Then use it:
+```bash
+python ultimate_crawler.py --domains domains.txt --tabs 5
+```
+
 ---
 
 ## 🎯 What Gets Captured

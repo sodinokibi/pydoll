@@ -1,0 +1,18 @@
+# Domain List Example
+# Lines starting with # are comments
+# Domains can be with or without https://
+
+# E-commerce sites
+example.com
+shop.example.com
+https://api.example.com
+
+# SaaS platforms
+app.mycompany.com
+https://admin.mycompany.com
+staging.mycompany.com
+
+# Corporate sites
+company.io
+www.company.io
+blog.company.io

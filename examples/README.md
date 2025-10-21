@@ -57,6 +57,117 @@ See **[TURBO_MODE_GUIDE.md](./TURBO_MODE_GUIDE.md)** for:
 
 ---
 
+## 🎯 Ultimate Crawler (All-In-One)
+
+### `ultimate_crawler.py` ⭐ BEST FOR MULTI-DOMAIN SCANS
+
+**Combines ALL features: Concurrent crawling + Domain lists + Secret scanning + Full customization.**
+
+#### Quick Start
+
+```bash
+# Single domain (backward compatible with secret_scanner_crawler.py)
+python ultimate_crawler.py https://example.com
+
+# Multiple domains from file
+python ultimate_crawler.py --domains domains.txt
+
+# Multi-domain with speed boost (5 concurrent tabs)
+python ultimate_crawler.py --domains domains.txt --tabs 5
+
+# Full-featured scan
+python ultimate_crawler.py --domains domains.txt \
+    --tabs 5 \
+    --discover-subdomains \
+    --max-pages 1000 \
+    --proxy http://proxy:8080 \
+    --bypass-captcha
+```
+
+#### Domain List Format
+
+Create a `domains.txt` file:
+```
+# Lines starting with # are comments
+example.com
+shop.example.com
+https://api.example.com
+company.io
+www.company.io
+```
+
+#### Features
+
+- ✅ **Multi-domain support** - Crawl multiple domains from a file
+- ✅ **Configurable speed** - 1-5 concurrent tabs (default: 1 for backward compatibility)
+- ✅ **Subdomain discovery** - External tools + passive discovery
+- ✅ **TruffleHog-ready output** - Organized by domain and risk level
+- ✅ **All security features** - Proxy, CAPTCHA bypass, etc.
+- ✅ **Smart queue** - Prioritizes high-value files (.env, config.json)
+
+#### When to Use
+
+- ✅ **Bug bounty programs** - Scan multiple targets efficiently
+- ✅ **Infrastructure audits** - Scan all company domains
+- ✅ **Multi-tenant security** - Scan multiple customer sites
+- ✅ **Batch processing** - Automate scans across domain lists
+- ✅ **Full-scope assessments** - Everything in one command
+
+#### Output Structure
+
+```
+trufflehog_scan_output/
+├── example.com/
+│   ├── high_priority/
+│   ├── javascript/
+│   ├── config_files/
+│   └── logs/
+├── shop.example.com/
+│   ├── high_priority/
+│   └── ...
+└── scan_summary.json
+```
+
+#### Examples
+
+```bash
+# Example 1: Bug bounty - scan all in-scope domains
+cat bug_bounty_scope.txt
+# example.com
+# *.example.com
+# api.example.com
+
+python ultimate_crawler.py --domains bug_bounty_scope.txt \
+    --tabs 5 \
+    --discover-subdomains \
+    --max-pages 500
+
+# Example 2: Internal audit with auth proxy
+python ultimate_crawler.py --domains internal_sites.txt \
+    --tabs 3 \
+    --proxy http://auth:pass@proxy:8080
+
+# Example 3: Fast scan of production sites
+python ultimate_crawler.py --domains production_domains.txt \
+    --tabs 5 \
+    --bypass-captcha
+```
+
+#### Backward Compatibility
+
+The ultimate_crawler.py is fully backward compatible with secret_scanner_crawler.py:
+
+```bash
+# These work identically
+python secret_scanner_crawler.py https://example.com
+python ultimate_crawler.py https://example.com
+
+# But ultimate_crawler.py also supports:
+python ultimate_crawler.py --domains domains.txt --tabs 5
+```
+
+---
+
 ## 🔐 Secret Scanning (TruffleHog Integration)
 
 ### `secret_scanner_crawler.py` + TruffleHog ⭐ RECOMMENDED FOR SECURITY
