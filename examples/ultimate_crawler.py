@@ -54,6 +54,15 @@ from pydoll.browser import Chrome
 from pydoll.browser.options import ChromiumOptions
 from pydoll.protocol.network.events import NetworkEvent
 
+# JS Beautification
+try:
+    import jsbeautifier
+    BEAUTIFIER_AVAILABLE = True
+except ImportError:
+    BEAUTIFIER_AVAILABLE = False
+    print("[WARNING] jsbeautifier not installed - JS beautification disabled")
+    print("[INFO] Install with: pip install jsbeautifier")
+
 
 class UltimateCrawler:
     """
@@ -428,6 +437,27 @@ class UltimateCrawler:
 
             filepath = save_dir / filename
             filepath.write_text(content, encoding='utf-8', errors='ignore')
+
+            # Beautify JavaScript files for better readability and TruffleHog detection
+            if content_type == 'javascript' and BEAUTIFIER_AVAILABLE:
+                try:
+                    beautifier_options = jsbeautifier.default_options()
+                    beautifier_options.indent_size = 2
+                    beautifier_options.wrap_line_length = 120
+
+                    beautified_content = jsbeautifier.beautify(content, beautifier_options)
+
+                    # Save beautified version with .beautified.js extension
+                    beautified_filename = filename.replace('.js', '.beautified.js')
+                    beautified_filepath = save_dir / beautified_filename
+                    beautified_filepath.write_text(beautified_content, encoding='utf-8', errors='ignore')
+
+                    if self.verbose:
+                        print(f"    ✨ Beautified: {beautified_filename[:60]}")
+                except Exception as e:
+                    # Don't fail the whole save if beautification fails
+                    if self.verbose:
+                        print(f"    [WARNING] Beautification failed for {filename}: {e}")
 
             # Save metadata for context enrichment
             metadata = {

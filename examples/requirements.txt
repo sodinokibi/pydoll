@@ -1,0 +1,65 @@
+# Pydoll Secret Scanning Examples - Dependencies
+
+## Core Dependencies (Required)
+pydoll-python>=2.0.0
+
+## Secret Scanning Dependencies (Required)
+# TruffleHog - Installed separately (see below)
+
+## Optional Dependencies
+jsbeautifier>=1.14.0  # For JavaScript beautification (highly recommended)
+# Semgrep - Installed separately (see below)
+
+## Installation
+
+### 1. Install Python Dependencies
+```bash
+cd examples
+pip install -r requirements.txt
+```
+
+### 2. Install TruffleHog (Required)
+
+**macOS:**
+```bash
+brew install trufflehog
+```
+
+**Linux:**
+```bash
+curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+```
+
+**Docker:**
+```bash
+docker pull trufflesecurity/trufflehog:latest
+```
+
+### 3. Install Semgrep (Optional - for enhanced detection)
+
+**Python:**
+```bash
+pip install semgrep
+```
+
+**macOS:**
+```bash
+brew install semgrep
+```
+
+## Verify Installation
+
+```bash
+# Check TruffleHog
+trufflehog --version
+
+# Check Semgrep (optional)
+semgrep --version
+
+# Check Python dependencies
+python3 -c "import pydoll; import jsbeautifier; print('All dependencies installed!')"
+```
+
+## Usage
+
+See SECRETS_WORKFLOW_GUIDE.md for complete usage instructions.
