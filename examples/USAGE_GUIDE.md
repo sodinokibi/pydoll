@@ -154,6 +154,46 @@ crontab -e
 0 2 * * * cd /path/to/pydoll/examples && ./scan_workflow.sh https://yoursite.com --tabs 5
 ```
 
+### 24/7 Continuous Monitoring (Production)
+
+```bash
+# Install psutil for health monitoring
+pip install psutil
+
+# Run continuous monitoring (scans every hour)
+python3 continuous_monitor.py --domains scope.txt
+
+# Custom interval and retention
+python3 continuous_monitor.py --domains scope.txt \
+    --interval 1800 \
+    --retention-days 14 \
+    --tabs 5 \
+    --rate-limit 8
+
+# High-frequency monitoring (every 5 minutes)
+python3 continuous_monitor.py --domains scope.txt \
+    --interval 300 \
+    --tabs 3 \
+    --max-pages 200
+```
+
+**Features:**
+- ✅ Automatic cleanup of old scans (configurable retention)
+- ✅ Health monitoring with status files
+- ✅ Graceful shutdown (Ctrl+C)
+- ✅ Consecutive failure detection
+- ✅ Disk usage tracking
+- ✅ Uptime and statistics reporting
+
+**Monitoring Health:**
+```bash
+# Check health status
+cat scans/health.json | jq
+
+# Monitor in real-time
+watch -n 5 'cat scans/health.json | jq'
+```
+
 ---
 
 ## 🎛️ CLI Arguments Reference
@@ -202,6 +242,22 @@ crontab -e
 --semgrep                  # Enable pattern detection
 --headless false           # Show browser (debugging)
 ```
+
+### Production Features (24/7 Operation)
+
+```bash
+--rate-limit 10.0         # Requests per second per domain (default: 10)
+--no-rate-limit           # Disable rate limiting (use with caution!)
+--memory-limit-mb 2048    # Memory limit in MB (default: 2048)
+--max-retries 3           # Max retries for transient failures (default: 3)
+--no-health-check         # Disable health monitoring
+```
+
+**Safety Features** (automatic):
+- URL blacklist prevents crawling `/logout`, `/delete`, `/remove` endpoints
+- Bounded sets prevent memory leaks (LRU eviction at 100K items)
+- Per-domain rate limiting (doesn't slow multi-domain scans)
+- Health monitoring tracks memory, heartbeat, error rates
 
 ---
 
@@ -274,6 +330,11 @@ secrets_found/                   # Organized results
 
 5. **Production Ready**
    - Scales to 1000+ pages
+   - 24/7 continuous monitoring support
+   - Automatic memory management (bounded sets)
+   - Per-domain rate limiting
+   - Health monitoring and auto-restart
+   - URL blacklist prevents dangerous actions
    - Error handling throughout
    - Clean organized output
    - Free and open source

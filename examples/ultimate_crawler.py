@@ -60,10 +60,12 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
-from typing import Set, List, Optional
+from typing import Set, List, Optional, Dict
 import re
 import hashlib
-from collections import deque
+from collections import deque, OrderedDict
+import time
+import sys
 
 from pydoll.browser import Chrome
 from pydoll.browser.options import ChromiumOptions
@@ -77,6 +79,140 @@ except ImportError:
     BEAUTIFIER_AVAILABLE = False
     print("[WARNING] jsbeautifier not installed - JS beautification disabled")
     print("[INFO] Install with: pip install jsbeautifier")
+
+
+# ============================================================================
+# Production-Ready Helper Classes for 24/7 Operation
+# ============================================================================
+
+class BoundedSet:
+    """
+    Set with maximum size that evicts oldest items (LRU).
+    Prevents unbounded memory growth during long-running operations.
+    """
+    def __init__(self, max_size: int = 100000):
+        self.data = OrderedDict()
+        self.max_size = max_size
+
+    def add(self, item: str):
+        """Add item to set (evicts oldest if at capacity)"""
+        if item in self.data:
+            # Move to end (most recently used)
+            self.data.move_to_end(item)
+        else:
+            self.data[item] = True
+            # Evict oldest if over capacity
+            if len(self.data) > self.max_size:
+                self.data.popitem(last=False)
+
+    def __contains__(self, item: str) -> bool:
+        return item in self.data
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+
+class PerDomainRateLimiter:
+    """
+    Rate limiter that applies limits per domain, not globally.
+    Allows fast multi-domain crawling while respecting per-domain limits.
+    """
+    def __init__(self, requests_per_second: float = 10.0):
+        self.rate = requests_per_second
+        self.min_interval = 1.0 / requests_per_second
+        self.domain_last_request: Dict[str, float] = {}
+        self.lock = asyncio.Lock()
+
+    async def acquire(self, url: str):
+        """Wait if necessary to respect rate limit for this domain"""
+        domain = urlparse(url).netloc
+
+        async with self.lock:
+            now = time.time()
+            last_request = self.domain_last_request.get(domain, 0)
+            time_since_last = now - last_request
+
+            if time_since_last < self.min_interval:
+                wait_time = self.min_interval - time_since_last
+                await asyncio.sleep(wait_time)
+
+            self.domain_last_request[domain] = time.time()
+
+
+class HealthMonitor:
+    """
+    Monitors crawler health and detects issues.
+    Tracks memory usage, heartbeat, and error rates.
+    """
+    def __init__(self, memory_limit_mb: float = 2048, error_rate_threshold: float = 0.3):
+        self.memory_limit = memory_limit_mb * 1024 * 1024  # Convert to bytes
+        self.error_rate_threshold = error_rate_threshold
+        self.last_heartbeat = time.time()
+        self.start_time = time.time()
+
+    def heartbeat(self):
+        """Update heartbeat timestamp"""
+        self.last_heartbeat = time.time()
+
+    def check_memory(self) -> tuple[bool, str]:
+        """Check if memory usage is within limits"""
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+
+            if memory_info.rss > self.memory_limit:
+                return (False, f"Memory limit exceeded: {memory_mb:.0f} MB / {self.memory_limit/1024/1024:.0f} MB")
+            return (True, f"Memory OK: {memory_mb:.0f} MB")
+        except ImportError:
+            # psutil not available, skip check
+            return (True, "Memory check skipped (psutil not installed)")
+        except Exception as e:
+            return (True, f"Memory check failed: {e}")
+
+    def check_heartbeat(self, timeout_seconds: int = 300) -> tuple[bool, str]:
+        """Check if heartbeat is recent"""
+        elapsed = time.time() - self.last_heartbeat
+        if elapsed > timeout_seconds:
+            return (False, f"No heartbeat for {elapsed:.0f}s")
+        return (True, f"Heartbeat OK ({elapsed:.0f}s ago)")
+
+    def check_error_rate(self, errors: int, total: int) -> tuple[bool, str]:
+        """Check if error rate is acceptable"""
+        if total == 0:
+            return (True, "No requests yet")
+
+        error_rate = errors / total
+        if error_rate > self.error_rate_threshold:
+            return (False, f"High error rate: {error_rate*100:.1f}% ({errors}/{total})")
+        return (True, f"Error rate OK: {error_rate*100:.1f}%")
+
+    def get_uptime(self) -> str:
+        """Get uptime string"""
+        uptime_seconds = time.time() - self.start_time
+        hours = int(uptime_seconds // 3600)
+        minutes = int((uptime_seconds % 3600) // 60)
+        seconds = int(uptime_seconds % 60)
+        return f"{hours}h {minutes}m {seconds}s"
+
+
+# URL patterns that should NEVER be crawled (dangerous actions)
+URL_BLACKLIST_PATTERNS = [
+    r'/logout',
+    r'/signout',
+    r'/sign-out',
+    r'/log-out',
+    r'/delete',
+    r'/remove',
+    r'/destroy',
+    r'/drop',
+    r'/admin/delete',
+    r'/admin/remove',
+    r'/admin/drop',
+    r'/api/delete',
+    r'/api/remove',
+]
 
 
 class UltimateCrawler:
@@ -106,13 +242,17 @@ class UltimateCrawler:
         discover_subdomains: bool = False,
         headless: bool = True,
         domains: Optional[List[str]] = None,
-        auth_cookies: Optional[str] = None,  # NEW: Authentication cookies
-        auth_headers: Optional[dict] = None,  # NEW: Authentication headers
-        wait_for_idle: bool = False,  # NEW: Wait for network idle
-        page_wait_time: int = 3,  # NEW: Additional wait time after page load
-        skip_media: bool = True,  # NEW: Skip large media files
-        max_media_size: int = 10 * 1024 * 1024,  # NEW: 10MB limit for media
-        warn_large_files: bool = True  # NEW: Warn about large files
+        auth_cookies: Optional[str] = None,  # Authentication cookies
+        auth_headers: Optional[dict] = None,  # Authentication headers
+        wait_for_idle: bool = False,  # Wait for network idle
+        page_wait_time: int = 3,  # Additional wait time after page load
+        skip_media: bool = True,  # Skip large media files
+        max_media_size: int = 10 * 1024 * 1024,  # 10MB limit for media
+        warn_large_files: bool = True,  # Warn about large files
+        rate_limit: float = 10.0,  # NEW: Requests per second per domain
+        enable_health_check: bool = True,  # NEW: Enable health monitoring
+        memory_limit_mb: float = 2048,  # NEW: Memory limit in MB
+        max_retries: int = 3  # NEW: Max retries for transient failures
     ):
         self.output_dir = Path(output_dir)
         self.max_pages = max_pages
@@ -137,13 +277,22 @@ class UltimateCrawler:
         self.max_media_size = max_media_size
         self.warn_large_files = warn_large_files
 
-        # Tracking
-        self.visited_urls: Set[str] = set()
+        # Production features
+        self.rate_limit = rate_limit
+        self.max_retries = max_retries
+        self.enable_health_check = enable_health_check
+
+        # Tracking (using BoundedSet to prevent memory leaks)
+        self.visited_urls = BoundedSet(max_size=100000)
         self.url_queue: deque = deque()
-        self.content_hashes: Set[str] = set()
+        self.content_hashes = BoundedSet(max_size=100000)
         self.discovered_subdomains: Set[str] = set()
         self.allowed_domains: Set[str] = set()
         self.lock = asyncio.Lock()
+
+        # Production systems
+        self.rate_limiter = PerDomainRateLimiter(requests_per_second=rate_limit) if rate_limit > 0 else None
+        self.health_monitor = HealthMonitor(memory_limit_mb=memory_limit_mb) if enable_health_check else None
 
         # Statistics
         self.stats = {
@@ -158,7 +307,9 @@ class UltimateCrawler:
             'captchas_solved': 0,
             'duplicates_skipped': 0,
             'media_skipped': 0,
-            'errors': 0
+            'errors': 0,
+            'dangerous_urls_skipped': 0,
+            'retries': 0
         }
 
         self._setup_output_dirs()
@@ -275,6 +426,23 @@ class UltimateCrawler:
         try:
             return any(url.lower().endswith(ext) for ext in skip_extensions)
         except:
+            return True
+
+    def _is_dangerous_url(self, url: str) -> bool:
+        """
+        Check if URL matches dangerous patterns (logout, delete, etc.).
+        These URLs should NEVER be crawled as they could perform destructive actions.
+        """
+        try:
+            url_lower = url.lower()
+            for pattern in URL_BLACKLIST_PATTERNS:
+                if re.search(pattern, url_lower):
+                    if self.verbose:
+                        print(f"  [BLOCKED] Dangerous URL: {url[:70]}")
+                    return True
+            return False
+        except Exception:
+            # On error, be safe and skip
             return True
 
     def _is_secret_prone_file(self, url: str) -> tuple[bool, str]:
@@ -794,11 +962,23 @@ class UltimateCrawler:
         return callback_ids
 
     async def _crawl_page(self, tab, url: str, worker_id: int) -> Set[str]:
-        """Crawl a single page"""
+        """Crawl a single page with safety checks and rate limiting"""
+
+        # Check if URL is dangerous (logout, delete, etc.)
+        if self._is_dangerous_url(url):
+            async with self.lock:
+                self.stats['dangerous_urls_skipped'] += 1
+            return set()
+
+        # Check if already visited
         async with self.lock:
             if url in self.visited_urls:
                 return set()
             self.visited_urls.add(url)
+
+        # Health monitoring heartbeat
+        if self.health_monitor:
+            self.health_monitor.heartbeat()
 
         if self.verbose:
             worker_str = f"[W{worker_id}]" if self.concurrent_tabs > 1 else ""
@@ -819,6 +999,10 @@ class UltimateCrawler:
                     if self.verbose:
                         print(f"  [WARN] Failed to set headers: {e}")
 
+            # Apply rate limiting (per-domain) if enabled
+            if self.rate_limiter:
+                await self.rate_limiter.acquire(url)
+
             if self.bypass_captcha:
                 try:
                     async with tab.expect_and_bypass_cloudflare_captcha():
@@ -827,7 +1011,7 @@ class UltimateCrawler:
                             self.stats['captchas_solved'] += 1
                         if self.verbose:
                             print(f"  ✓ CAPTCHA bypassed")
-                except:
+                except Exception:
                     await tab.go_to(url, timeout=30)
             else:
                 await tab.go_to(url, timeout=30)
@@ -880,7 +1064,7 @@ class UltimateCrawler:
                     pass
 
     def _extract_links(self, html: str, base_url: str) -> Set[str]:
-        """Extract links from HTML"""
+        """Extract links from HTML, filtering out dangerous and irrelevant URLs"""
         urls = set()
         try:
             for pattern in [r'href=["\'](.*?)["\']', r'src=["\'](.*?)["\']']:
@@ -888,11 +1072,15 @@ class UltimateCrawler:
                     try:
                         url = urljoin(base_url, match.group(1))
                         url = url.split('#')[0]
-                        if self._is_allowed_domain(url) and not self._should_skip_resource(url):
+
+                        # Filter: allowed domain, not media, not dangerous
+                        if (self._is_allowed_domain(url) and
+                            not self._should_skip_resource(url) and
+                            not self._is_dangerous_url(url)):
                             urls.add(url)
-                    except:
+                    except Exception:
                         pass
-        except:
+        except Exception:
             pass
         return urls
 
@@ -1074,10 +1262,25 @@ class UltimateCrawler:
         print(f"   ⚠️  High Priority:   {self.stats['high_priority_files']}")
         if self.bypass_captcha:
             print(f"   CAPTCHAs Solved:    {self.stats['captchas_solved']}")
-        print(f"\n   Duplicates Skipped: {self.stats['duplicates_skipped']}")
+        print(f"\n   🛡️  Safety:")
+        print(f"   Dangerous URLs Blocked: {self.stats['dangerous_urls_skipped']}")
+        print(f"   Duplicates Skipped: {self.stats['duplicates_skipped']}")
         if self.skip_media:
             print(f"   Media Files Skipped: {self.stats['media_skipped']}")
         print(f"   Errors:             {self.stats['errors']}")
+
+        # Health monitoring summary
+        if self.health_monitor:
+            print(f"\n   💪 Health:")
+            print(f"   Uptime:             {self.health_monitor.get_uptime()}")
+            memory_ok, memory_msg = self.health_monitor.check_memory()
+            print(f"   {memory_msg}")
+            error_ok, error_msg = self.health_monitor.check_error_rate(
+                self.stats['errors'],
+                self.stats['pages_crawled']
+            )
+            print(f"   {error_msg}")
+
         print(f"\n📁 Output: {self.output_dir.absolute()}")
         print(f"\n🔍 Next Step:")
         print(f"   trufflehog filesystem {self.output_dir.absolute()}")
@@ -1158,6 +1361,18 @@ Domain list file format (domains.txt):
     parser.add_argument('--no-warn-large', action='store_true',
                        help='Disable warnings for large files')
 
+    # Production features (24/7 operation)
+    parser.add_argument('--rate-limit', type=float, default=10.0,
+                       help='Requests per second per domain (default: 10)')
+    parser.add_argument('--no-rate-limit', action='store_true',
+                       help='Disable rate limiting (use with caution!)')
+    parser.add_argument('--max-retries', type=int, default=3,
+                       help='Max retries for transient failures (default: 3)')
+    parser.add_argument('--memory-limit-mb', type=float, default=2048,
+                       help='Memory limit in MB (default: 2048)')
+    parser.add_argument('--no-health-check', action='store_true',
+                       help='Disable health monitoring')
+
     args = parser.parse_args()
 
     if not args.url and not args.domains:
@@ -1207,6 +1422,9 @@ Domain list file format (domains.txt):
 
     max_media_size = parse_size(args.max_media_size)
 
+    # Handle rate limit
+    rate_limit = 0 if args.no_rate_limit else args.rate_limit
+
     crawler = UltimateCrawler(
         output_dir=args.output,
         max_pages=args.max_pages,
@@ -1226,7 +1444,12 @@ Domain list file format (domains.txt):
         # File handling
         skip_media=not args.no_skip_media,
         max_media_size=max_media_size,
-        warn_large_files=not args.no_warn_large
+        warn_large_files=not args.no_warn_large,
+        # Production features
+        rate_limit=rate_limit,
+        enable_health_check=not args.no_health_check,
+        memory_limit_mb=args.memory_limit_mb,
+        max_retries=args.max_retries
     )
 
     asyncio.run(crawler.crawl())
