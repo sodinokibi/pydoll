@@ -1,0 +1,630 @@
+"""
+TruffleHog-Ready Web Crawler
+=============================
+
+Crawls ANY website/domain and captures data optimized for TruffleHog scanning.
+
+Specifically targets files that commonly contain secrets:
+- .env files
+- config.js, config.json
+- API documentation
+- JavaScript bundles (may contain hardcoded keys)
+- JSON responses (may leak keys)
+
+Output format is optimized for TruffleHog to scan.
+
+Usage:
+    python secret_scanner_crawler.py https://target.com
+    python secret_scanner_crawler.py https://api.example.com --max-pages 500
+
+Then scan with TruffleHog:
+    trufflehog filesystem ./trufflehog_scan_output/
+"""
+
+import asyncio
+import argparse
+import json
+import sys
+from pathlib import Path
+from urllib.parse import urlparse, urljoin
+from datetime import datetime
+from typing import Set, List, Dict
+import re
+import hashlib
+
+from pydoll.browser import Chrome
+from pydoll.browser.options import ChromiumOptions
+from pydoll.protocol.network.events import NetworkEvent
+
+
+class SecretScannerCrawler:
+    """
+    Crawler optimized for secret scanning with TruffleHog.
+    Targets files that commonly contain secrets.
+    """
+
+    # Files that commonly contain secrets
+    SECRET_PRONE_PATTERNS = {
+        # Environment files
+        '.env', '.env.local', '.env.production', '.env.development',
+        '.env.staging', '.env.test',
+
+        # Config files
+        'config.js', 'config.json', 'config.yml', 'config.yaml',
+        'configuration.js', 'configuration.json',
+        'settings.js', 'settings.json',
+        'constants.js', 'constants.json',
+
+        # AWS/Cloud configs
+        'credentials', 'aws.json', 'gcp.json', 'azure.json',
+
+        # Database configs
+        'database.yml', 'database.json', 'db.json',
+
+        # API configs
+        'api-keys.json', 'apikeys.json', 'secrets.json',
+
+        # Build/deployment
+        '.npmrc', '.pypirc', 'package.json', 'composer.json',
+
+        # Docker/K8s
+        'docker-compose.yml', 'docker-compose.yaml',
+        'deployment.yml', 'deployment.yaml',
+    }
+
+    # URL patterns that might contain secrets
+    SECRET_PRONE_PATHS = {
+        '/config', '/configuration', '/settings', '/api-keys',
+        '/.env', '/env', '/credentials', '/secrets',
+        '/admin/config', '/api/config',
+    }
+
+    # Common API endpoint patterns
+    API_PATTERNS = [
+        r'/api/', r'/v\d+/', r'/graphql', r'/rest/',
+        r'/oauth', r'/auth', r'/token', r'/login',
+        r'/webhook', r'/callback'
+    ]
+
+    def __init__(
+        self,
+        output_dir: str = "./trufflehog_scan_output",
+        max_pages: int = 200,
+        concurrent_tabs: int = 3,
+        verbose: bool = True
+    ):
+        self.output_dir = Path(output_dir)
+        self.max_pages = max_pages
+        self.concurrent_tabs = concurrent_tabs
+        self.verbose = verbose
+
+        # Tracking
+        self.visited_urls: Set[str] = set()
+        self.url_queue: List[str] = []
+        self.content_hashes: Set[str] = set()
+        self.domain = None
+
+        # Statistics
+        self.stats = {
+            'pages_crawled': 0,
+            'js_files': 0,
+            'config_files': 0,
+            'api_endpoints': 0,
+            'env_files': 0,
+            'high_priority_files': 0,
+            'errors': 0
+        }
+
+        # Setup directory structure optimized for TruffleHog
+        self._setup_output_dirs()
+
+    def _setup_output_dirs(self):
+        """Create output structure optimized for TruffleHog scanning"""
+        # TruffleHog will scan these directories
+        (self.output_dir / "javascript").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "config_files").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "env_files").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "api_responses").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "html_pages").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "high_priority").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    def _is_same_domain(self, url: str) -> bool:
+        """Check if URL belongs to target domain or subdomain"""
+        if not self.domain:
+            return True
+
+        hostname = urlparse(url).netloc.lower()
+        return hostname == self.domain or hostname.endswith(f'.{self.domain}')
+
+    def _should_skip_resource(self, url: str) -> bool:
+        """Skip media and non-target resources"""
+        if not self._is_same_domain(url):
+            return True
+
+        # Skip media files (we don't need these for secrets)
+        skip_extensions = {
+            '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico',
+            '.mp4', '.webm', '.avi', '.mov', '.mkv',
+            '.mp3', '.wav', '.ogg',
+            '.woff', '.woff2', '.ttf', '.eot',
+            '.pdf', '.zip', '.tar', '.gz', '.exe', '.dmg'
+        }
+
+        return any(url.lower().endswith(ext) for ext in skip_extensions)
+
+    def _is_secret_prone_file(self, url: str) -> tuple[bool, str]:
+        """
+        Check if URL is a file that commonly contains secrets.
+        Returns (is_prone, priority_level)
+        """
+        url_lower = url.lower()
+        path = urlparse(url_lower).path
+
+        # HIGH PRIORITY: .env files
+        if any(pattern in url_lower for pattern in ['.env', '/env/', 'environment']):
+            return (True, 'high')
+
+        # HIGH PRIORITY: Named secret files
+        for pattern in self.SECRET_PRONE_PATTERNS:
+            if pattern in path:
+                return (True, 'high')
+
+        # HIGH PRIORITY: Secret paths
+        for pattern in self.SECRET_PRONE_PATHS:
+            if pattern in path:
+                return (True, 'high')
+
+        # MEDIUM PRIORITY: Config-like files
+        if any(word in path for word in ['config', 'setting', 'constant', 'credential']):
+            return (True, 'medium')
+
+        # MEDIUM PRIORITY: API endpoints
+        for pattern in self.API_PATTERNS:
+            if re.search(pattern, path):
+                return (True, 'medium')
+
+        # LOW PRIORITY: Any JS file (might have hardcoded keys)
+        if path.endswith('.js'):
+            return (True, 'low')
+
+        return (False, 'none')
+
+    def _classify_content(self, url: str, content: str, mime_type: str = '') -> str:
+        """Classify content type for appropriate storage"""
+        url_lower = url.lower()
+        path = urlparse(url_lower).path
+
+        # .env files
+        if '.env' in url_lower or 'environment' in url_lower:
+            return 'env_file'
+
+        # Config files
+        if any(p in url_lower for p in self.SECRET_PRONE_PATTERNS):
+            return 'config_file'
+
+        # JavaScript
+        if path.endswith('.js') or mime_type == 'application/javascript':
+            return 'javascript'
+
+        # JSON (might be config or API response)
+        if path.endswith('.json') or mime_type == 'application/json':
+            try:
+                json.loads(content)
+                # If it looks like config, save as config
+                if any(word in path for word in ['config', 'setting', 'key', 'secret']):
+                    return 'config_file'
+                return 'api_response'
+            except:
+                pass
+
+        # HTML
+        if mime_type == 'text/html':
+            return 'html_page'
+
+        return 'other'
+
+    def _hash_content(self, content: str) -> str:
+        """Generate content hash for deduplication"""
+        return hashlib.sha256(content.encode('utf-8', errors='ignore')).hexdigest()[:16]
+
+    def _sanitize_filename(self, url: str) -> str:
+        """Create safe filename from URL"""
+        parsed = urlparse(url)
+        # Use path + query to make unique
+        name = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        name = re.sub(r'[^\w\-_.]', '_', name)
+        name = name.strip('_')[:200]  # Limit length
+        return name or 'index'
+
+    def _save_content(self, url: str, content: str, content_type: str, is_high_priority: bool = False):
+        """Save content to appropriate directory for TruffleHog scanning"""
+
+        # Skip if duplicate
+        content_hash = self._hash_content(content)
+        if content_hash in self.content_hashes:
+            return
+
+        self.content_hashes.add(content_hash)
+
+        # Determine directory
+        dir_map = {
+            'env_file': self.output_dir / "env_files",
+            'config_file': self.output_dir / "config_files",
+            'javascript': self.output_dir / "javascript",
+            'api_response': self.output_dir / "api_responses",
+            'html_page': self.output_dir / "html_pages",
+        }
+
+        save_dir = dir_map.get(content_type, self.output_dir / "other")
+
+        # Create filename with hash to avoid duplicates
+        base_name = self._sanitize_filename(url)
+        filename = f"{content_hash}_{base_name}"
+
+        # Add appropriate extension
+        if content_type == 'javascript' and not filename.endswith('.js'):
+            filename += '.js'
+        elif content_type in ['config_file', 'api_response', 'env_file'] and not filename.endswith('.json'):
+            # Try to preserve original extension or use .txt
+            if not any(filename.endswith(ext) for ext in ['.json', '.yml', '.yaml', '.env', '.txt']):
+                filename += '.txt'
+
+        filepath = save_dir / filename
+
+        # Save content
+        try:
+            filepath.write_text(content, encoding='utf-8', errors='ignore')
+
+            # Also save high priority to separate dir for quick scanning
+            if is_high_priority:
+                high_pri_path = self.output_dir / "high_priority" / filename
+                high_pri_path.write_text(content, encoding='utf-8', errors='ignore')
+                self.stats['high_priority_files'] += 1
+
+            # Update stats
+            if content_type == 'env_file':
+                self.stats['env_files'] += 1
+            elif content_type == 'config_file':
+                self.stats['config_files'] += 1
+            elif content_type == 'javascript':
+                self.stats['js_files'] += 1
+
+            if self.verbose:
+                priority = "⚠️  HIGH" if is_high_priority else "   "
+                print(f"  {priority} [{content_type}] {url[:80]}")
+
+            # Log the file with metadata
+            self._log_file(url, filename, content_type, is_high_priority, len(content))
+
+        except Exception as e:
+            if self.verbose:
+                print(f"  [ERROR] Failed to save {url}: {e}")
+            self.stats['errors'] += 1
+
+    def _log_file(self, url: str, filename: str, content_type: str, is_high_priority: bool, size: int):
+        """Log captured file with metadata"""
+        log_entry = {
+            'url': url,
+            'filename': filename,
+            'type': content_type,
+            'high_priority': is_high_priority,
+            'size': size,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        log_file = self.output_dir / "logs" / "captured_files.jsonl"
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(log_entry) + '\n')
+
+    async def _setup_network_capture(self, tab):
+        """Setup network interception to capture all content"""
+
+        await tab.enable_network_events()
+
+        # Track requests by ID
+        requests_map = {}
+
+        async def on_request_sent(event):
+            """Capture outgoing requests"""
+            params = event.get('params', {})
+            request = params.get('request', {})
+
+            url = request.get('url', '')
+            if self._should_skip_resource(url):
+                return
+
+            request_id = params.get('requestId', '')
+            resource_type = params.get('type', '')
+            method = request.get('method', 'GET')
+
+            # Check if this is a high-value target
+            is_secret_prone, priority = self._is_secret_prone_file(url)
+
+            requests_map[request_id] = {
+                'url': url,
+                'method': method,
+                'type': resource_type,
+                'is_secret_prone': is_secret_prone,
+                'priority': priority,
+                'post_data': request.get('postData')
+            }
+
+        async def on_response_received(event):
+            """Capture responses and save content"""
+            params = event.get('params', {})
+            response = params.get('response', {})
+            request_id = params.get('requestId', '')
+
+            if request_id not in requests_map:
+                return
+
+            req_info = requests_map[request_id]
+            url = req_info['url']
+            status = response.get('status', 0)
+            mime_type = response.get('mimeType', '')
+
+            # Only process successful responses
+            if status not in [200, 201]:
+                return
+
+            try:
+                # Get response body
+                body = await tab.get_response_body(request_id)
+                if not body:
+                    return
+
+                # Classify and save
+                content_type = self._classify_content(url, body, mime_type)
+                is_high_priority = req_info['priority'] == 'high'
+
+                self._save_content(url, body, content_type, is_high_priority)
+
+                # If this was a POST request, log it as potential API endpoint
+                if req_info['method'] == 'POST' and req_info.get('post_data'):
+                    self.stats['api_endpoints'] += 1
+
+                    # Save API endpoint info
+                    api_log = {
+                        'method': req_info['method'],
+                        'url': url,
+                        'request_body': req_info['post_data'],
+                        'response_body': body[:1000],  # First 1KB
+                        'timestamp': datetime.now().isoformat()
+                    }
+
+                    api_file = self.output_dir / "logs" / "api_endpoints.jsonl"
+                    with open(api_file, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(api_log) + '\n')
+
+            except Exception as e:
+                # Some responses might not be available
+                if self.verbose and req_info['is_secret_prone']:
+                    print(f"  [WARN] Could not get response for {url}: {e}")
+
+        # Subscribe to events
+        await tab.on(NetworkEvent.REQUEST_WILL_BE_SENT, on_request_sent)
+        await tab.on(NetworkEvent.RESPONSE_RECEIVED, on_response_received)
+
+    async def _crawl_page(self, tab, url: str) -> Set[str]:
+        """Crawl a single page"""
+
+        if url in self.visited_urls:
+            return set()
+
+        self.visited_urls.add(url)
+
+        if self.verbose:
+            print(f"\n[{len(self.visited_urls)}/{self.max_pages}] 🔍 {url}")
+
+        try:
+            # Setup network capture BEFORE navigation
+            await self._setup_network_capture(tab)
+
+            # Navigate with timeout
+            await tab.go_to(url, timeout=30)
+
+            # Wait for network to settle
+            await asyncio.sleep(2)
+
+            # Get page HTML (might contain embedded secrets)
+            html = await tab.page_source
+
+            # Check if HTML itself looks like it might contain secrets
+            is_secret_prone, priority = self._is_secret_prone_file(url)
+            self._save_content(url, html, 'html_page', priority == 'high')
+
+            # Extract links for further crawling
+            discovered_urls = self._extract_links(html, url)
+
+            self.stats['pages_crawled'] += 1
+
+            return discovered_urls
+
+        except asyncio.TimeoutError:
+            if self.verbose:
+                print(f"  [TIMEOUT] {url}")
+            self.stats['errors'] += 1
+            return set()
+        except Exception as e:
+            if self.verbose:
+                print(f"  [ERROR] {url}: {e}")
+            self.stats['errors'] += 1
+            return set()
+
+    def _extract_links(self, html: str, base_url: str) -> Set[str]:
+        """Extract links from HTML for crawling"""
+        urls = set()
+
+        # Find href and src attributes
+        for pattern in [r'href=["\'](.*?)["\']', r'src=["\'](.*?)["\']']:
+            for match in re.finditer(pattern, html, re.IGNORECASE):
+                try:
+                    url = urljoin(base_url, match.group(1))
+                    url = url.split('#')[0]  # Remove fragments
+
+                    if self._is_same_domain(url) and not self._should_skip_resource(url):
+                        urls.add(url)
+                except:
+                    pass
+
+        return urls
+
+    async def crawl(self, start_url: str):
+        """Main crawl function"""
+
+        # Set domain from start URL
+        self.domain = urlparse(start_url).netloc
+        self.url_queue = [start_url]
+
+        print("=" * 80)
+        print("🔐 SECRET SCANNER CRAWLER (TruffleHog Ready)")
+        print("=" * 80)
+        print(f"Target:     {start_url}")
+        print(f"Domain:     {self.domain}")
+        print(f"Max Pages:  {self.max_pages}")
+        print(f"Output:     {self.output_dir.absolute()}")
+        print("=" * 80)
+        print("\n🎯 Targeting secret-prone files:")
+        print("  • .env files")
+        print("  • config.js, config.json")
+        print("  • API endpoints")
+        print("  • JavaScript bundles")
+        print("  • JSON responses")
+        print("\n" + "=" * 80 + "\n")
+
+        # Browser options - optimize for speed and stealth
+        options = ChromiumOptions()
+        options.browser_preferences = {
+            'profile': {
+                'default_content_setting_values': {
+                    'images': 2,  # Block images
+                }
+            }
+        }
+
+        async with Chrome(options=options) as browser:
+            # Start headless
+            tab = await browser.start(headless=True)
+
+            pages_crawled = 0
+
+            while self.url_queue and pages_crawled < self.max_pages:
+                url = self.url_queue.pop(0)
+
+                if url in self.visited_urls:
+                    continue
+
+                # Crawl page
+                discovered_urls = await self._crawl_page(tab, url)
+
+                # Prioritize secret-prone URLs
+                high_priority = []
+                low_priority = []
+
+                for new_url in discovered_urls:
+                    if new_url not in self.visited_urls and new_url not in self.url_queue:
+                        is_prone, priority = self._is_secret_prone_file(new_url)
+                        if is_prone and priority == 'high':
+                            high_priority.append(new_url)
+                        else:
+                            low_priority.append(new_url)
+
+                # Add high priority first
+                self.url_queue = high_priority + self.url_queue + low_priority
+
+                pages_crawled += 1
+
+        # Generate final report
+        self._generate_report()
+
+    def _generate_report(self):
+        """Generate final scan report"""
+
+        report = {
+            'scan_info': {
+                'domain': self.domain,
+                'timestamp': datetime.now().isoformat(),
+                'pages_crawled': self.stats['pages_crawled'],
+                'errors': self.stats['errors']
+            },
+            'captured_files': {
+                'javascript_files': self.stats['js_files'],
+                'config_files': self.stats['config_files'],
+                'env_files': self.stats['env_files'],
+                'api_endpoints': self.stats['api_endpoints'],
+                'high_priority_files': self.stats['high_priority_files']
+            },
+            'next_steps': {
+                'command': f"trufflehog filesystem {self.output_dir.absolute()}",
+                'high_priority_scan': f"trufflehog filesystem {self.output_dir.absolute()}/high_priority",
+                'description': "Run TruffleHog to scan captured files for secrets"
+            }
+        }
+
+        # Save report
+        report_file = self.output_dir / "scan_report.json"
+        report_file.write_text(json.dumps(report, indent=2), encoding='utf-8')
+
+        # Print summary
+        print("\n" + "=" * 80)
+        print("✅ CRAWL COMPLETE")
+        print("=" * 80)
+        print(f"📊 Statistics:")
+        print(f"   Pages Crawled:      {self.stats['pages_crawled']}")
+        print(f"   JavaScript Files:   {self.stats['js_files']}")
+        print(f"   Config Files:       {self.stats['config_files']}")
+        print(f"   .env Files:         {self.stats['env_files']}")
+        print(f"   API Endpoints:      {self.stats['api_endpoints']}")
+        print(f"   ⚠️  High Priority:   {self.stats['high_priority_files']}")
+        print(f"   Errors:             {self.stats['errors']}")
+        print(f"\n📁 Output: {self.output_dir.absolute()}")
+        print(f"\n🔍 Next Step - Run TruffleHog:")
+        print(f"   trufflehog filesystem {self.output_dir.absolute()}")
+        print(f"\n⚠️  Scan high priority files first:")
+        print(f"   trufflehog filesystem {self.output_dir.absolute()}/high_priority")
+        print("=" * 80 + "\n")
+
+
+def main():
+    """CLI entry point"""
+
+    parser = argparse.ArgumentParser(
+        description='TruffleHog-Ready Web Crawler - Captures data for secret scanning',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python secret_scanner_crawler.py https://example.com
+  python secret_scanner_crawler.py https://api.example.com --max-pages 500
+  python secret_scanner_crawler.py https://app.example.com -o ./scan_output
+
+Then scan with TruffleHog:
+  trufflehog filesystem ./trufflehog_scan_output/
+        """
+    )
+
+    parser.add_argument('url', help='Target URL to crawl')
+    parser.add_argument('-o', '--output', default='./trufflehog_scan_output',
+                       help='Output directory (default: ./trufflehog_scan_output)')
+    parser.add_argument('-m', '--max-pages', type=int, default=200,
+                       help='Maximum pages to crawl (default: 200)')
+    parser.add_argument('-t', '--tabs', type=int, default=3,
+                       help='Concurrent tabs (default: 3)')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                       help='Quiet mode (less output)')
+
+    args = parser.parse_args()
+
+    # Create and run crawler
+    crawler = SecretScannerCrawler(
+        output_dir=args.output,
+        max_pages=args.max_pages,
+        concurrent_tabs=args.tabs,
+        verbose=not args.quiet
+    )
+
+    asyncio.run(crawler.crawl(args.url))
+
+
+if __name__ == "__main__":
+    main()

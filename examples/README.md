@@ -2,7 +2,68 @@
 
 This directory contains efficient web crawler implementations using Pydoll.
 
-## Files
+---
+
+## 🔐 Secret Scanning (TruffleHog Integration)
+
+### `secret_scanner_crawler.py` + TruffleHog ⭐ RECOMMENDED FOR SECURITY
+
+**Crawl ANY domain and scan for leaked API keys, credentials, and secrets.**
+
+#### One-Command Solution
+
+```bash
+# Automated: Crawl + Scan in one step
+./scan_for_secrets.sh https://example.com
+
+# Manual: Step by step
+python secret_scanner_crawler.py https://example.com
+trufflehog filesystem ./trufflehog_scan_output/
+```
+
+#### What It Does
+
+✅ **Crawls ANY domain** - Works on any website
+✅ **Targets secret-prone files** - .env, config.js, api-keys.json
+✅ **Captures API endpoints** - POST/GET with request/response
+✅ **TruffleHog-ready output** - Optimized for secret scanning
+✅ **Prioritizes by risk** - High priority files separated
+
+#### Files Targeted
+
+- `.env`, `.env.production`, `.env.local`
+- `config.js`, `config.json`, `settings.json`
+- `credentials`, `api-keys.json`, `secrets.json`
+- `database.yml`, `aws.json`, `azure.json`
+- JavaScript bundles (may contain hardcoded keys)
+- API responses (may leak credentials)
+
+#### Output Format
+
+```
+trufflehog_scan_output/
+├── high_priority/         ⭐ Scan this first!
+│   ├── .env files
+│   ├── config files
+│   └── api-keys
+├── javascript/            All JS files
+├── config_files/          Config files
+├── api_responses/         JSON responses
+└── scan_report.json       Summary
+```
+
+#### Complete Guide
+
+See **[TRUFFLEHOG_GUIDE.md](./TRUFFLEHOG_GUIDE.md)** for:
+- Complete workflow
+- TruffleHog command reference
+- Real-world examples
+- Automation setup
+- Security best practices
+
+---
+
+## General Purpose Crawlers
 
 ### 1. `simple_production_crawler.py` ⭐ START HERE
 
