@@ -684,7 +684,18 @@ class UltimateCrawler:
                 self.stats['errors'] += 1
 
     async def _setup_network_capture(self, tab, worker_id: int):
-        """Setup network interception"""
+        """
+        Setup network interception to capture responses.
+
+        Media Filtering:
+        - Filters media files by extension (.jpg, .mp4, .mp3, etc.)
+        - Prevents processing/saving of media files
+        - Saves: processing time, memory usage, disk space
+
+        Note: Browser may still download files (Chrome downloads before
+        we see the request). For true bandwidth savings, would need
+        Network.setBlockedURLs CDP command (not implemented yet).
+        """
         try:
             await tab.enable_network_events()
         except:
@@ -693,13 +704,20 @@ class UltimateCrawler:
         requests_map = {}
         callback_ids = []
 
-        async def on_request_sent(event):
+        async def on_request_will_be_sent(event):
             try:
                 params = event.get('params', {})
                 request = params.get('request', {})
                 url = request.get('url', '')
 
-                if self._should_skip_resource(url):
+                # Skip media files entirely (saves bandwidth by not tracking them)
+                if self.skip_media and self._should_skip_resource(url):
+                    if self.verbose:
+                        # Only log occasionally to avoid spam
+                        if url.endswith(('.mp4', '.webm', '.avi', '.mov')):
+                            print(f"  [SKIP] Media blocked: {url[:60]}")
+                    async with self.lock:
+                        self.stats['media_skipped'] += 1
                     return
 
                 request_id = params.get('requestId', '')
@@ -730,6 +748,7 @@ class UltimateCrawler:
                 response = params.get('response', {})
                 request_id = params.get('requestId', '')
 
+                # Skip if not in requests_map (already filtered in on_request_will_be_sent)
                 if request_id not in requests_map:
                     return
 
@@ -737,29 +756,6 @@ class UltimateCrawler:
                 status = response.get('status', 0)
 
                 if status not in [200, 201]:
-                    return
-
-                # Check file size before downloading
-                headers = response.get('headers', {})
-                content_length = headers.get('Content-Length') or headers.get('content-length', '0')
-                try:
-                    file_size = int(content_length)
-                except (ValueError, TypeError):
-                    file_size = 0
-
-                # Smart file handling - check if we should skip this file
-                mime_type = response.get('mimeType', '')
-                should_skip, reason = self._should_skip_file(
-                    req_info['url'],
-                    mime_type,
-                    file_size
-                )
-
-                if should_skip:
-                    if self.verbose:
-                        print(f"  [SKIP] {reason}: {req_info['url'][:60]}")
-                    async with self.lock:
-                        self.stats['media_skipped'] += 1
                     return
 
                 body = await tab.get_response_body(request_id)
@@ -789,7 +785,7 @@ class UltimateCrawler:
                 pass
 
         try:
-            cb_id1 = await tab.on(NetworkEvent.REQUEST_WILL_BE_SENT, on_request_sent)
+            cb_id1 = await tab.on(NetworkEvent.REQUEST_WILL_BE_SENT, on_request_will_be_sent)
             cb_id2 = await tab.on(NetworkEvent.RESPONSE_RECEIVED, on_response_received)
             callback_ids = [cb_id1, cb_id2]
         except:
