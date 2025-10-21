@@ -4,6 +4,59 @@ This directory contains efficient web crawler implementations using Pydoll.
 
 ---
 
+## 🚀 Turbo Crawler (Concurrent Multi-Tab)
+
+### `turbo_crawler.py` ⭐ FASTEST - 5X SPEED
+
+**Maximum speed crawling with concurrent tabs + subdomain discovery.**
+
+#### Quick Start
+
+```bash
+# Turbo mode (3 concurrent tabs) - 3x faster
+python turbo_crawler.py https://example.com
+
+# High speed (5 tabs) - 5x faster
+python turbo_crawler.py https://example.com --tabs 5
+
+# With subdomain discovery (uses subfinder if installed)
+python turbo_crawler.py https://example.com --discover-subdomains
+
+# Full turbo mode
+python turbo_crawler.py https://example.com \
+    --tabs 5 \
+    --discover-subdomains \
+    --max-pages 1000 \
+    --proxy http://proxy:8080 \
+    --bypass-captcha
+```
+
+#### Features
+
+- ✅ **5x faster** - Concurrent crawling with multiple tabs
+- ✅ **Subdomain discovery** - External tools (subfinder/amass) + passive
+- ✅ **Smart queue** - Prioritizes high-value files
+- ✅ **Session sharing** - Cookies/auth shared across tabs
+- ✅ **All security features** - Proxy, CAPTCHA bypass, etc.
+
+#### When to Use
+
+- ✅ Large websites (500+ pages)
+- ✅ Multiple subdomains
+- ✅ Need maximum speed
+- ✅ Full scope security assessment
+- ✅ Bug bounty programs
+
+#### Complete Guide
+
+See **[TURBO_MODE_GUIDE.md](./TURBO_MODE_GUIDE.md)** for:
+- Speed comparisons
+- Subdomain discovery options
+- Performance tuning
+- Real-world examples
+
+---
+
 ## 🔐 Secret Scanning (TruffleHog Integration)
 
 ### `secret_scanner_crawler.py` + TruffleHog ⭐ RECOMMENDED FOR SECURITY
