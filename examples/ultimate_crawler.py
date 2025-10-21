@@ -8,6 +8,9 @@ The complete solution with ALL features:
 - ✅ Subdomain discovery - external tools + passive
 - ✅ Proxy support - HTTP/SOCKS5
 - ✅ CAPTCHA bypass - Cloudflare, reCAPTCHA
+- ✅ Authentication support - cookies + headers
+- ✅ SPA waiting - network idle + configurable wait
+- ✅ Smart file handling - skip media, NEVER skip JS
 - ✅ TruffleHog-ready output
 - ✅ Smart priority queue
 - ✅ Session sharing
@@ -22,10 +25,22 @@ Usage:
     # With speed boost (3 concurrent tabs)
     python ultimate_crawler.py https://example.com --tabs 3
 
+    # Authenticated crawl (cookies + headers)
+    python ultimate_crawler.py https://app.example.com \
+        --auth-cookie "session=abc123; token=xyz789" \
+        --auth-header "Authorization: Bearer token123"
+
+    # SPA support (wait for dynamic content)
+    python ultimate_crawler.py https://react-app.com \
+        --wait-for-idle \
+        --page-wait 5
+
     # Full featured
     python ultimate_crawler.py --domains domains.txt \
         --tabs 5 \
         --discover-subdomains \
+        --auth-cookie "session=abc123" \
+        --wait-for-idle \
         --proxy http://proxy:8080 \
         --bypass-captcha \
         --max-pages 1000
@@ -90,7 +105,14 @@ class UltimateCrawler:
         bypass_captcha: bool = False,
         discover_subdomains: bool = False,
         headless: bool = True,
-        domains: Optional[List[str]] = None
+        domains: Optional[List[str]] = None,
+        auth_cookies: Optional[str] = None,  # NEW: Authentication cookies
+        auth_headers: Optional[dict] = None,  # NEW: Authentication headers
+        wait_for_idle: bool = False,  # NEW: Wait for network idle
+        page_wait_time: int = 3,  # NEW: Additional wait time after page load
+        skip_media: bool = True,  # NEW: Skip large media files
+        max_media_size: int = 10 * 1024 * 1024,  # NEW: 10MB limit for media
+        warn_large_files: bool = True  # NEW: Warn about large files
     ):
         self.output_dir = Path(output_dir)
         self.max_pages = max_pages
@@ -101,6 +123,19 @@ class UltimateCrawler:
         self.discover_subdomains = discover_subdomains
         self.headless = headless
         self.domains = domains or []
+
+        # Authentication
+        self.auth_cookies = auth_cookies
+        self.auth_headers = auth_headers or {}
+
+        # SPA/Dynamic content handling
+        self.wait_for_idle = wait_for_idle
+        self.page_wait_time = page_wait_time
+
+        # File handling
+        self.skip_media = skip_media
+        self.max_media_size = max_media_size
+        self.warn_large_files = warn_large_files
 
         # Tracking
         self.visited_urls: Set[str] = set()
@@ -404,6 +439,136 @@ class UltimateCrawler:
 
         return secrets_found
 
+    async def _inject_cookies(self, browser, url: str):
+        """Inject authentication cookies before crawling"""
+        if not self.auth_cookies:
+            return
+
+        try:
+            tab = await browser.get_tab()
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc
+
+            # Parse cookie string (format: "session=abc123; token=xyz789")
+            cookies_injected = 0
+            for cookie_str in self.auth_cookies.split(';'):
+                cookie_str = cookie_str.strip()
+                if '=' in cookie_str:
+                    name, value = cookie_str.split('=', 1)
+                    await tab.set_cookie(
+                        name=name.strip(),
+                        value=value.strip(),
+                        domain=domain
+                    )
+                    cookies_injected += 1
+
+            if self.verbose:
+                print(f"[AUTH] Injected {cookies_injected} cookies for {domain}")
+
+        except Exception as e:
+            if self.verbose:
+                print(f"[WARNING] Cookie injection failed: {e}")
+
+    async def _wait_for_network_idle(self, tab, timeout: int = 10):
+        """
+        Wait for network to be idle (no requests for 500ms).
+        Useful for SPAs that load content dynamically.
+        """
+        try:
+            start_time = asyncio.get_event_loop().time()
+            last_request_time = start_time
+
+            async def on_request(_):
+                nonlocal last_request_time
+                last_request_time = asyncio.get_event_loop().time()
+
+            # Monitor network requests
+            try:
+                cb_id = await tab.on(NetworkEvent.REQUEST_WILL_BE_SENT, on_request)
+            except:
+                # If we can't monitor, just wait the timeout
+                await asyncio.sleep(0.5)
+                return
+
+            # Wait until no requests for 500ms or timeout
+            while True:
+                await asyncio.sleep(0.5)
+                now = asyncio.get_event_loop().time()
+
+                # Idle for 500ms?
+                if (now - last_request_time) >= 0.5:
+                    break
+
+                # Timeout?
+                if (now - start_time) > timeout:
+                    if self.verbose:
+                        print(f"    [WARN] Network idle timeout after {timeout}s")
+                    break
+
+            try:
+                await tab.off(cb_id)
+            except:
+                pass
+
+        except Exception as e:
+            if self.verbose:
+                print(f"    [WARN] Network idle wait failed: {e}")
+
+    def _should_skip_file(self, url: str, mime_type: str, file_size: int) -> tuple[bool, str]:
+        """
+        Determine if file should be skipped based on type and size.
+
+        Returns: (should_skip, reason)
+
+        CRITICAL RULES:
+        - NEVER skip JavaScript files (regardless of size) - they often contain secrets!
+        - Skip large media files if skip_media enabled
+        - Warn about large files if warn_large_files enabled
+        """
+
+        # NEVER SKIP JAVASCRIPT - these often contain the most secrets!
+        if 'javascript' in mime_type.lower() or url.lower().endswith('.js'):
+            # Still warn if it's unusually large
+            if self.warn_large_files and file_size > 50 * 1024 * 1024:  # 50MB
+                size_mb = file_size / (1024 * 1024)
+                if self.verbose:
+                    print(f"  [WARN] Large JS file ({size_mb:.1f}MB): {url[:60]}")
+            return (False, "")  # Never skip!
+
+        # Skip large media files if enabled
+        if self.skip_media:
+            media_types = [
+                'image/', 'video/', 'audio/',
+                'font/', 'application/octet-stream'
+            ]
+
+            media_extensions = [
+                '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg',
+                '.mp4', '.webm', '.avi', '.mov', '.mp3', '.wav',
+                '.woff', '.woff2', '.ttf', '.eot', '.otf'
+            ]
+
+            # Check MIME type
+            for media_type in media_types:
+                if media_type in mime_type.lower():
+                    if file_size > self.max_media_size:
+                        size_mb = file_size / (1024 * 1024)
+                        return (True, f"Large media file ({size_mb:.1f}MB)")
+
+            # Check file extension
+            if any(url.lower().endswith(ext) for ext in media_extensions):
+                if file_size > self.max_media_size:
+                    size_mb = file_size / (1024 * 1024)
+                    return (True, f"Media file ({size_mb:.1f}MB)")
+
+        # Warn about other large files but still download them
+        if self.warn_large_files and file_size > 100 * 1024 * 1024:  # 100MB
+            size_mb = file_size / (1024 * 1024)
+            if self.verbose:
+                print(f"  [WARN] Large file ({size_mb:.1f}MB): {url[:60]}")
+
+        return (False, "")
+
     async def _save_content(self, url: str, content: str, content_type: str, is_high_priority: bool = False, response_data: dict = None):
         """Save content with metadata (thread-safe)"""
         try:
@@ -569,6 +734,27 @@ class UltimateCrawler:
                 if status not in [200, 201]:
                     return
 
+                # Check file size before downloading
+                headers = response.get('headers', {})
+                content_length = headers.get('Content-Length') or headers.get('content-length', '0')
+                try:
+                    file_size = int(content_length)
+                except (ValueError, TypeError):
+                    file_size = 0
+
+                # Smart file handling - check if we should skip this file
+                mime_type = response.get('mimeType', '')
+                should_skip, reason = self._should_skip_file(
+                    req_info['url'],
+                    mime_type,
+                    file_size
+                )
+
+                if should_skip:
+                    if self.verbose:
+                        print(f"  [SKIP] {reason}: {req_info['url'][:60]}")
+                    return
+
                 body = await tab.get_response_body(request_id)
                 if not body:
                     return
@@ -620,6 +806,16 @@ class UltimateCrawler:
         try:
             callback_ids = await self._setup_network_capture(tab, worker_id)
 
+            # Set custom headers if provided
+            if self.auth_headers:
+                try:
+                    await tab.set_extra_headers(self.auth_headers)
+                    if self.verbose:
+                        print(f"  [AUTH] Set {len(self.auth_headers)} custom headers")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  [WARN] Failed to set headers: {e}")
+
             if self.bypass_captcha:
                 try:
                     async with tab.expect_and_bypass_cloudflare_captcha():
@@ -633,7 +829,17 @@ class UltimateCrawler:
             else:
                 await tab.go_to(url, timeout=30)
 
-            await asyncio.sleep(1)
+            # Wait for dynamic content (SPA support)
+            if self.wait_for_idle:
+                if self.verbose:
+                    print(f"  ⏱️  Waiting for network idle...")
+                await self._wait_for_network_idle(tab)
+
+            # Additional wait time (configurable, default 3s)
+            if self.page_wait_time > 0:
+                await asyncio.sleep(self.page_wait_time)
+            else:
+                await asyncio.sleep(1)
 
             html = await tab.page_source
             is_secret_prone, priority = self._is_secret_prone_file(url)
@@ -795,6 +1001,11 @@ class UltimateCrawler:
         async with Chrome(options=options) as browser:
             await browser.start(headless=self.headless)
 
+            # Inject authentication cookies if provided
+            if self.auth_cookies and urls_to_crawl:
+                first_url = urls_to_crawl[0] if urls_to_crawl[0].startswith('http') else f'https://{urls_to_crawl[0]}'
+                await self._inject_cookies(browser, first_url)
+
             # Create worker tabs
             tabs = []
             for i in range(self.concurrent_tabs):
@@ -919,6 +1130,26 @@ Domain list file format (domains.txt):
     parser.add_argument('-q', '--quiet', action='store_true',
                        help='Quiet mode')
 
+    # Authentication
+    parser.add_argument('--auth-cookie', type=str,
+                       help='Authentication cookies (format: "name1=value1; name2=value2")')
+    parser.add_argument('--auth-header', type=str, action='append',
+                       help='Authentication header (format: "Name: Value"). Can be used multiple times.')
+
+    # SPA/Dynamic content
+    parser.add_argument('--wait-for-idle', action='store_true',
+                       help='Wait for network to be idle before capturing (for SPAs)')
+    parser.add_argument('--page-wait', type=int, default=3,
+                       help='Wait time in seconds after page load (default: 3)')
+
+    # File handling
+    parser.add_argument('--no-skip-media', action='store_true',
+                       help='Download all media files (default: skip large media)')
+    parser.add_argument('--max-media-size', type=str, default='10M',
+                       help='Max size for media files (e.g., 10M, 50M). Default: 10M')
+    parser.add_argument('--no-warn-large', action='store_true',
+                       help='Disable warnings for large files')
+
     args = parser.parse_args()
 
     if not args.url and not args.domains:
@@ -945,6 +1176,29 @@ Domain list file format (domains.txt):
     elif args.url:
         domains = [args.url]
 
+    # Parse auth headers
+    auth_headers = {}
+    if args.auth_header:
+        for header in args.auth_header:
+            if ':' in header:
+                name, value = header.split(':', 1)
+                auth_headers[name.strip()] = value.strip()
+
+    # Parse max media size (e.g., "10M" -> 10485760)
+    def parse_size(size_str: str) -> int:
+        """Parse size string like '10M', '50M' to bytes"""
+        size_str = size_str.upper().strip()
+        if size_str.endswith('M'):
+            return int(size_str[:-1]) * 1024 * 1024
+        elif size_str.endswith('K'):
+            return int(size_str[:-1]) * 1024
+        elif size_str.endswith('G'):
+            return int(size_str[:-1]) * 1024 * 1024 * 1024
+        else:
+            return int(size_str)
+
+    max_media_size = parse_size(args.max_media_size)
+
     crawler = UltimateCrawler(
         output_dir=args.output,
         max_pages=args.max_pages,
@@ -954,7 +1208,17 @@ Domain list file format (domains.txt):
         bypass_captcha=args.bypass_captcha,
         discover_subdomains=args.discover_subdomains,
         headless=headless,
-        domains=domains
+        domains=domains,
+        # Authentication
+        auth_cookies=args.auth_cookie,
+        auth_headers=auth_headers if auth_headers else None,
+        # SPA support
+        wait_for_idle=args.wait_for_idle,
+        page_wait_time=args.page_wait,
+        # File handling
+        skip_media=not args.no_skip_media,
+        max_media_size=max_media_size,
+        warn_large_files=not args.no_warn_large
     )
 
     asyncio.run(crawler.crawl())
